@@ -16,6 +16,7 @@ package tablecodec
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"time"
 
@@ -71,7 +72,42 @@ func EncodeRowKeyWithHandle(tableID int64, handle int64) kv.Key {
 
 // DecodeRecordKey decodes the key and gets the tableID, handle.
 func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
-	/* Your code here */
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("invalid record key: %w", err)
+		}
+	}()
+
+	// tablePrefix
+	if !key.HasPrefix(tablePrefix) {
+		err = fmt.Errorf("invalid table prefix")
+		return
+	}
+	key = key[len(tablePrefix):]
+
+	// tableID
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		return
+	}
+
+	// recordPrefixSep
+	if !key.HasPrefix(recordPrefixSep) {
+		err = fmt.Errorf("invalid sep")
+		return
+	}
+	key = key[len(recordPrefixSep):]
+
+	// handle
+	key, handle, err = codec.DecodeInt(key)
+	if err != nil {
+		return
+	}
+
+	if len(key) != 0 {
+		err = fmt.Errorf("unrecognizable tail")
+	}
+
 	return
 }
 
@@ -94,8 +130,41 @@ func EncodeIndexSeekKey(tableID int64, idxID int64, encodedValue []byte) kv.Key 
 
 // DecodeIndexKeyPrefix decodes the key and gets the tableID, indexID, indexValues.
 func DecodeIndexKeyPrefix(key kv.Key) (tableID int64, indexID int64, indexValues []byte, err error) {
-	/* Your code here */
-	return tableID, indexID, indexValues, nil
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("invalid index key prefix: %w", err)
+		}
+	}()
+
+	// tablePrefix
+	if !key.HasPrefix(tablePrefix) {
+		err = fmt.Errorf("invalid table prefix")
+		return
+	}
+	key = key[len(tablePrefix):]
+
+	// tableID
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		return
+	}
+
+	// indexPrefixSep
+	if !key.HasPrefix(indexPrefixSep) {
+		err = fmt.Errorf("invalid sep")
+		return
+	}
+	key = key[len(recordPrefixSep):]
+
+	// handle
+	key, indexID, err = codec.DecodeInt(key)
+	if err != nil {
+		return
+	}
+
+	indexValues = key
+
+	return
 }
 
 // DecodeIndexKey decodes the key and gets the tableID, indexID, indexValues.
