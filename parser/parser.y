@@ -3809,7 +3809,10 @@ JoinTable:
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
-	/* Your code here. */
+|	TableRef JoinType "JOIN" TableRef "ON" Expression %prec tableRefPriority
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $4.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: &ast.OnCondition{Expr: $6}}
+	}
 
 JoinType:
 	"LEFT"
