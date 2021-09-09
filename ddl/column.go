@@ -15,6 +15,8 @@ package ddl
 
 import (
 	"fmt"
+	"sync/atomic"
+
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/infoschema"
@@ -26,7 +28,6 @@ import (
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"go.uber.org/zap"
-	"sync/atomic"
 )
 
 // adjustColumnInfoInAddColumn is used to set the correct position of column info when adding column.
@@ -219,13 +220,27 @@ func onDropColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	//       (Think about how the not null property and default value will influence the `Drop Column` operation.
 	switch colInfo.State {
 	case model.StatePublic:
-		// To be filled
+		// public -> required ? write only : delete only
+		adjustColumnInfoInDropColumn(tblInfo, colInfo.Offset)
+		if mysql.HasNotNullFlag(colInfo.Flag) && colInfo.DefaultValue == nil {
+			// required col
+			colInfo.State = model.StateWriteOnly
+			job.SchemaState = model.StateWriteOnly
+		} else {
+			// optional col
+			colInfo.State = model.StateDeleteOnly
+			job.SchemaState = model.StateDeleteOnly
+		}
 		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateWriteOnly:
-		// To be filled
+		// write only -> delete only
+		colInfo.State = model.StateDeleteOnly
+		job.SchemaState = model.StateDeleteReorganization
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteOnly:
-		// To be filled
+		// delete only -> reorganization
+		colInfo.State = model.StateDeleteReorganization
+		job.SchemaState = model.StateDeleteReorganization
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteReorganization:
 		// reorganization -> absent
