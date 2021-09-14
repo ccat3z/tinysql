@@ -353,10 +353,42 @@ func (p *LogicalProjection) PredicatePushDown(predicates []expression.Expression
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
 func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expression) (ret []expression.Expression, retPlan LogicalPlan) {
-	// TODO: Here you need to push the predicates across the aggregation.
-	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
-	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+	canBePushed := make([]expression.Expression, 0, len(predicates))
+	canNotBePushed := make([]expression.Expression, 0, len(predicates))
+
+	for _, expr := range predicates {
+		cols := expression.ExtractColumns(expr)
+		if len(cols) == 0 {
+			canBePushed = append(canBePushed, expr)
+			continue
+		}
+
+		canPush := true
+		for _, col := range cols {
+			if !la.isAggreateColumn(col) {
+				canPush = false
+			}
+		}
+		if canPush {
+			canBePushed = append(canBePushed, expr)
+		} else {
+			canNotBePushed = append(canNotBePushed, expr)
+		}
+	}
+
+	remained, childPlan := la.children[0].PredicatePushDown(canBePushed)
+	la.children[0] = childPlan
+	return append(remained, canNotBePushed...), la
+}
+
+func (la *LogicalAggregation) isAggreateColumn(column *expression.Column) bool {
+	for _, aggCol := range la.groupByCols {
+		if aggCol.Equal(la.ctx, column) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
