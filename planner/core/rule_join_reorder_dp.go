@@ -14,7 +14,8 @@
 package core
 
 import (
-	"github.com/pingcap/errors"
+	"math/bits"
+
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/parser/ast"
 )
@@ -35,16 +36,154 @@ type joinGroupNonEqEdge struct {
 	expr       expression.Expression
 }
 
+// solve reorder join group and create new LogicalPlan
+//
+// TODO: Need more test
 func (s *joinReorderDPSolver) solve(joinGroup []LogicalPlan, eqConds []expression.Expression) (LogicalPlan, error) {
-	// TODO: You need to implement the join reorder algo based on DP.
+	for _, join := range joinGroup {
+		s.curJoinGroup = append(s.curJoinGroup, &jrNode{
+			p:       join,
+			cumCost: s.baseNodeCumCost(join),
+		})
+	}
 
-	// The pseudo code can be found in README.
-	// And there's some common struct and method like `baseNodeCumCost`, `calcJoinCumCost` you can use in `rule_join_reorder.go`.
-	// Also, you can take a look at `rule_join_reorder_greedy.go`, this file implement the join reorder algo based on greedy algorithm.
-	// You'll see some common usages in the greedy version.
+	// Build eq graph
+	eqEdges := make([]joinGroupEqEdge, 0, len(eqConds))
+	eqGraph := make([][]int, len(joinGroup))
+	for _, eqCond := range eqConds {
+		sf := eqCond.(*expression.ScalarFunction)
+		args := sf.GetArgs()
+		lcol := args[0].(*expression.Column)
+		rcol := args[1].(*expression.Column)
+		lNodeID, err := findNodeIndexInGroup(joinGroup, lcol)
+		if err != nil {
+			return nil, err
+		}
+		rNodeID, err := findNodeIndexInGroup(joinGroup, rcol)
+		if err != nil {
+			return nil, err
+		}
 
-	// Note that the join tree may be disconnected. i.e. You need to consider the case `select * from t, t1, t2`.
-	return nil, errors.Errorf("unimplemented")
+		eqEdges = append(eqEdges, joinGroupEqEdge{
+			nodeIDs: []int{lNodeID, rNodeID},
+			edge:    sf,
+		})
+		eqGraph[lNodeID] = append(eqGraph[lNodeID], rNodeID)
+		eqGraph[rNodeID] = append(eqGraph[rNodeID], lNodeID)
+	}
+
+	// Loop connected graphs
+	newJoinGroup := make([]LogicalPlan, 0)
+	visitedJoinNodeIDs := make([]bool, len(s.curJoinGroup))
+	for i := range s.curJoinGroup {
+		if visitedJoinNodeIDs[i] {
+			continue
+		}
+
+		nodeIDs := extractConnectedNodes(eqGraph, i, visitedJoinNodeIDs)
+
+		// Find best plan in connected graph
+		join, err := s.findBestPlan(nodeIDs, eqEdges)
+		if err != nil {
+			return nil, err
+		}
+		newJoinGroup = append(newJoinGroup, join)
+	}
+
+	// TODO: Here I did not consider otherConds
+	return s.makeBushyJoin(newJoinGroup, s.otherConds), nil
+}
+
+// extractConnectedNodes extract a connected graph from start node
+// and update vistedJoinNodeIDs
+func extractConnectedNodes(graph [][]int, start int, visitedJoinNodeIDs []bool) (nodeIDs []int) {
+	if visitedJoinNodeIDs[start] {
+		return
+	}
+	visitedJoinNodeIDs[start] = true
+
+	queue := make([]int, 1)
+	queue[0] = start
+
+	for len(queue) > 0 {
+		node := queue[0]
+		nodeIDs = append(nodeIDs, node)
+		queue = queue[1:]
+
+		for _, nearNode := range graph[node] {
+			if visitedJoinNodeIDs[nearNode] {
+				continue
+			}
+
+			visitedJoinNodeIDs[nearNode] = true
+			queue = append(queue, nearNode)
+		}
+	}
+
+	return
+}
+
+// findBestPlan find best plan based on db. nodeIDs must be a connect graph.
+//
+// TODO: Need more test
+func (s *joinReorderDPSolver) findBestPlan(nodeIDs []int, eqEdges []joinGroupEqEdge) (LogicalPlan, error) {
+	bestPlan := make([]*jrNode, 1<<len(nodeIDs))
+	globalID2Mask := make(map[int]uint32) // TODO: Supports up to 32 nodes?
+	for id, globalID := range nodeIDs {
+		bestPlan[1<<id] = s.curJoinGroup[globalID]
+		globalID2Mask[globalID] = 1 << id
+	}
+
+	for group := uint32(1); group < (1 << len(nodeIDs)); group++ {
+		// The leaf nodes are predefined
+		if bits.OnesCount32(group) == 1 {
+			continue
+		}
+
+		// Loop sub groups
+		for sub := (group - 1) & group; sub > 0; sub = (sub - 1) & group {
+			remain := group ^ sub
+
+			if bestPlan[sub] == nil || bestPlan[remain] == nil {
+				// sub or remain is not connectivity graph
+				continue
+			}
+
+			// Find used edges
+			usedEdges := make([]joinGroupEqEdge, 0)
+			for _, edge := range eqEdges {
+				lNodeMask := globalID2Mask[edge.nodeIDs[0]]
+				rNodeMask := globalID2Mask[edge.nodeIDs[1]]
+				if (sub&lNodeMask > 0 && remain&rNodeMask > 0) || (sub&rNodeMask > 0 && remain&lNodeMask > 0) {
+					usedEdges = append(usedEdges, edge)
+				}
+			}
+			if len(usedEdges) == 0 {
+				// sub is not connect to remain
+				continue
+			}
+
+			// Generate plan and calc cost
+			plan, err := s.newJoinWithEdge(bestPlan[remain].p, bestPlan[sub].p, usedEdges, nil)
+			if err != nil {
+				return nil, err
+			}
+			cost := s.calcJoinCumCost(plan, bestPlan[remain], bestPlan[sub])
+
+			// f[group] = min{join{f[sub], f[group ^ sub])}
+			if bestPlan[group] == nil {
+				bestPlan[group] = &jrNode{
+					p:       plan,
+					cumCost: cost,
+				}
+			} else if bestPlan[group].cumCost > cost {
+				bestPlan[group].p = plan
+				bestPlan[group].cumCost = cost
+			}
+		}
+	}
+
+	return bestPlan[len(bestPlan)-1].p, nil
 }
 
 func (s *joinReorderDPSolver) newJoinWithEdge(leftPlan, rightPlan LogicalPlan, edges []joinGroupEqEdge, otherConds []expression.Expression) (LogicalPlan, error) {
