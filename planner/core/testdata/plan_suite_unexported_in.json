@@ -41,6 +41,8 @@
   {
     "name": "TestPredicatePushDown",
     "cases": [
+      "select * from (select b, count(*) as a from t group by b) as f where f.a > 0",
+      "select * from (select b, count(*) as a from t group by b) as f where f.b > 0",
       "select count(*) from t a, t b where a.a = b.a",
       "select * from t ta join t tb on ta.d = tb.d and ta.d > 1 where tb.a = 0",
       "select * from t ta join t tb on ta.d = tb.d where ta.d > 1 and tb.a = 0",
