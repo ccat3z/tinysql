@@ -210,9 +210,45 @@ type candidatePath struct {
 // (3): does it require a double scan.
 // If `x` is not worse than `y` at all factors,
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
+// If `lhs` is better than `rhs`, 1 will be returned.
+// If `rhs` is better than `lhs`, -1 will be returned.
+// Otherwise, 0 will be returned.
 func compareCandidates(lhs, rhs *candidatePath) int {
-	// TODO: implement the content according to the header comment.
-	return 0
+	better := 0
+	worse := 0
+
+	// (1): the set of columns that occurred in the access condition,
+	if lhs.columnSet.Len() > rhs.columnSet.Len() {
+		better += 1
+	} else if lhs.columnSet.Len() < rhs.columnSet.Len() {
+		worse += 1
+	}
+
+	// (2): whether or not it matches the physical property
+	if lhs.isMatchProp != rhs.isMatchProp {
+		if lhs.isMatchProp {
+			better += 1
+		} else {
+			worse += 1
+		}
+	}
+
+	// (3): does it require a double scan.
+	if lhs.isSingleScan != rhs.isSingleScan {
+		if lhs.isSingleScan {
+			better += 1
+		} else {
+			worse += 1
+		}
+	}
+
+	if better > 0 && worse == 0 {
+		return 1
+	} else if worse > 0 && better == 0 {
+		return -1
+	} else {
+		return 0
+	}
 }
 
 func (ds *DataSource) getTableCandidate(path *util.AccessPath, prop *property.PhysicalProperty) *candidatePath {
@@ -274,7 +310,39 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
 		//       You'll need to implement the content in function `compareCandidates`.
 		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+
+		// prune worse paths
+		prunedCandidates := make([]*candidatePath, 0)
+		currentCandidateInserted := false
+		currentCandidateIsWorse := false
+		for _, candidate := range candidates {
+			cmp := compareCandidates(currentCandidate, candidate)
+			if cmp > 0 {
+				// eliminate worse candidate and append current candidate
+				if !currentCandidateInserted {
+					prunedCandidates = append(prunedCandidates, currentCandidate)
+					currentCandidateInserted = true
+				}
+			} else if cmp == 0 {
+				// candidate in window is incomparable with current candidate
+				prunedCandidates = append(prunedCandidates, candidate)
+			} else {
+				currentCandidateIsWorse = true
+				break
+			}
+		}
+
+		if currentCandidateIsWorse {
+			// if current candidate is dominated by any candidate in window,
+			// there should not be any candidates to be eliminated.
+			continue
+		}
+
+		if !currentCandidateInserted {
+			prunedCandidates = append(prunedCandidates, currentCandidate)
+		}
+
+		candidates = prunedCandidates
 	}
 	return candidates
 }
