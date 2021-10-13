@@ -494,8 +494,64 @@ func NewRulePushSelDownAggregation() Transformation {
 // It will transform `sel->agg->x` to `agg->sel->x` or `sel->agg->sel->x`
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
-	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+
+	exprsOriginal := make([]expression.Expression, 0, len(agg.AggFuncs))
+	for _, fun := range agg.AggFuncs {
+		exprsOriginal = append(exprsOriginal, fun.Args[0])
+	}
+
+	groupCols := expression.NewSchema(agg.GetGroupByCols()...)
+
+	aggSchema := old.Children[0].Prop.Schema
+	childGroup := old.Children[0].GetExpr().Children[0]
+
+	// Check conditions can or cannot be pushed
+	canBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+	canNotBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+	for _, cond := range sel.Conditions {
+		// TODO: Need more test for get/setvar
+		if !expression.HasGetSetVarFunc(cond) {
+			cols := expression.ExtractColumns(cond)
+			canPush := true
+			for _, col := range cols {
+				if !groupCols.Contains(col) {
+					canPush = false
+				}
+			}
+			if canPush {
+				canBePushed = append(canBePushed, cond)
+			} else {
+				canNotBePushed = append(canNotBePushed, cond)
+			}
+		} else {
+			canNotBePushed = append(canNotBePushed, cond)
+		}
+	}
+
+	// Create new exprs
+	if len(canBePushed) == 0 {
+		return nil, false, false, nil
+	}
+
+	// Create bottom sel if needed
+	newBottomSel := plannercore.LogicalSelection{Conditions: canBePushed}.Init(sel.SCtx())
+	newBottomSelExpr := memo.NewGroupExpr(newBottomSel)
+	newBottomSelExpr.SetChildren(childGroup)
+	newBottomSelGroup := memo.NewGroupWithSchema(newBottomSelExpr, childGroup.Prop.Schema)
+	newAggExpr := memo.NewGroupExpr(agg)
+	newAggExpr.SetChildren(newBottomSelGroup)
+	if len(canNotBePushed) == 0 {
+		return []*memo.GroupExpr{newAggExpr}, true, false, nil
+	}
+
+	// Create top sel if needed
+	newAggGroup := memo.NewGroupWithSchema(newAggExpr, aggSchema)
+	newTopSel := plannercore.LogicalSelection{Conditions: canNotBePushed}.Init(sel.SCtx())
+	newTopSelExpr := memo.NewGroupExpr(newTopSel)
+	newTopSelExpr.SetChildren(newAggGroup)
+	return []*memo.GroupExpr{newTopSelExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
