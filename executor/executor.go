@@ -389,11 +389,17 @@ func (e *SelectionExec) Next(ctx context.Context, req *chunk.Chunk) error {
 			1. the `req` chunk` is full.
 			2. there is no further results from child.
 			3. meets any error.
-	 */
+	*/
 	for {
 		// Fill in the `req` util it is full or the `inputIter` is fully processed.
 		for ; e.inputRow != e.inputIter.End(); e.inputRow = e.inputIter.Next() {
-			// Your code here.
+			if req.IsFull() {
+				return nil
+			}
+
+			if e.selected[e.inputRow.Idx()] {
+				req.AppendRow(e.inputRow)
+			}
 		}
 		err := Next(ctx, e.children[0], e.childResult)
 		if err != nil {
@@ -403,9 +409,15 @@ func (e *SelectionExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		if e.childResult.NumRows() == 0 {
 			return nil
 		}
-		/* Your code here.
-		   Process and filter the child result using `expression.VectorizedFilter`.
-		 */
+
+		// Filter data
+		e.selected, err = expression.VectorizedFilter(e.ctx, e.filters, e.inputIter, e.selected)
+		if err != nil {
+			return err
+		}
+
+		// Reset iter to begin
+		e.inputRow = e.inputIter.Begin()
 	}
 }
 
