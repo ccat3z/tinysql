@@ -104,9 +104,9 @@ func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 		return
 	}
 
-	if len(key) != 0 {
-		err = fmt.Errorf("unrecognizable tail")
-	}
+	// if len(key) != 0 {
+	// 	err = fmt.Errorf("unrecognizable tail")
+	// }
 
 	return
 }

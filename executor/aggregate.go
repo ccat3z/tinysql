@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/set"
+	"github.com/spaolacci/murmur3"
 	"go.uber.org/zap"
 )
 
@@ -352,7 +353,26 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 // shuffleIntermData shuffles the intermediate data of partial workers to corresponded final workers.
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
-	// TODO: implement the method body. Shuffle the data to final workers.
+	groupKeysByFinWorker := make([][]string, finalConcurrency)
+	for groupKey := range w.partialResultsMap {
+		// Ensure that each group key can only correspond to on final worker
+		finalWorkerIdx := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		if groupKeysByFinWorker[finalWorkerIdx] == nil {
+			groupKeysByFinWorker[finalWorkerIdx] = make([]string, 0, len(w.partialResultsMap)/finalConcurrency)
+		}
+		groupKeysByFinWorker[finalWorkerIdx] = append(groupKeysByFinWorker[finalWorkerIdx], groupKey)
+	}
+
+	for finWrkIdx := range groupKeysByFinWorker {
+		if groupKeysByFinWorker[finWrkIdx] == nil {
+			continue
+		}
+
+		w.outputChs[finWrkIdx] <- &HashAggIntermData{
+			groupKeys:        groupKeysByFinWorker[finWrkIdx],
+			partialResultMap: w.partialResultsMap,
+		}
+	}
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
@@ -422,8 +442,38 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 }
 
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
-	// TODO: implement the method body. This method consumes the data given by the partial workers.
-	return nil
+	intermBuf := make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
+	stmtCtx := sctx.GetSessionVars().StmtCtx
+	for {
+		partialInput, ok := w.getPartialInput()
+		if !ok {
+			return nil
+		}
+
+		for reachEnd := false; !reachEnd; {
+			var groupKeys []string
+			intermBuf, groupKeys, reachEnd = partialInput.getPartialResultBatch(stmtCtx, intermBuf[:0], w.aggFuncs, w.maxChunkSize)
+
+			w.groupKeys = w.groupKeys[:0]
+			for _, groupKey := range groupKeys {
+				w.groupKeys = append(w.groupKeys, []byte(groupKey))
+
+				if !w.groupSet.Exist(groupKey) {
+					w.groupSet.Insert(groupKey)
+				}
+			}
+
+			finalPartialResults := w.getPartialResult(stmtCtx, w.groupKeys, partialInput.partialResultMap)
+			for i := range groupKeys {
+				for j, agg := range w.aggFuncs {
+					err = agg.MergePartialResult(sctx, intermBuf[i][j], finalPartialResults[i][j])
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
